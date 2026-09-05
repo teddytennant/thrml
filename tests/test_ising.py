@@ -266,3 +266,66 @@ class TestEstimateKLGradFullyVisible(unittest.TestCase):
         # Positive-phase bias moments should be exactly the data spins (no sampling occurs)
         expected_spins = 2 * data.astype(moms_b_pos.dtype) - 1
         self.assertTrue(jnp.allclose(moms_b_pos[0], expected_spins))
+
+    def _fully_visible_positive_moments(self, model, nodes, edges, data_blocks, data):
+        """Run the no-free-variable positive phase and return its bias and weight moments."""
+        free_blocks = [Block(nodes[0::2]), Block(nodes[1::2])]
+
+        training_spec = IsingTrainingSpec(
+            model,
+            data_blocks=data_blocks,
+            conditioning_blocks=[],
+            positive_sampling_blocks=[],
+            negative_sampling_blocks=free_blocks,
+            schedule_positive=SamplingSchedule(n_warmup=0, n_samples=1, steps_per_sample=0),
+            schedule_negative=SamplingSchedule(n_warmup=0, n_samples=1, steps_per_sample=1),
+        )
+
+        key = jax.random.key(1)
+        init_free = hinton_init(key, model, free_blocks, (4,))
+
+        _, _, (moms_b_pos, moms_w_pos), _ = estimate_kl_grad(
+            key,
+            training_spec,
+            nodes,
+            edges,
+            [data[:, jnp.array([nodes.index(n) for n in block])] for block in data_blocks],
+            [],
+            [],
+            init_free,
+        )
+        return moms_b_pos[0], moms_w_pos[0]
+
+    def test_positive_moments_independent_of_data_block_order(self):
+        """The positive phase must map data columns to nodes by identity, not by position."""
+        key = jax.random.key(0)
+        nodes = [SpinNode() for _ in range(6)]
+        edges = [(nodes[i], nodes[i + 1]) for i in range(5)] + [(nodes[0], nodes[3])]
+
+        key, subkey = jax.random.split(key)
+        model = IsingEBM(
+            nodes,
+            edges,
+            biases=jax.random.normal(subkey, (6,)),
+            weights=jax.random.normal(subkey, (len(edges),)),
+            beta=jnp.array(1.0),
+        )
+
+        key, subkey = jax.random.split(key)
+        data = jax.random.bernoulli(subkey, 0.5, (8, 6)).astype(jnp.bool_)
+        spins = 2 * data.astype(jnp.float32) - 1
+        expected_w = jnp.stack([spins[:, nodes.index(a)] * spins[:, nodes.index(b)] for a, b in edges], axis=1)
+
+        permutation = [4, 0, 5, 2, 1, 3]
+        block_layouts = [
+            [Block(nodes)],
+            [Block([nodes[i] for i in permutation])],
+            [Block(nodes[3:]), Block(nodes[:3])],
+            [Block([nodes[0]]), Block(nodes[4:]), Block(nodes[1:4])],
+        ]
+
+        for data_blocks in block_layouts:
+            with self.subTest(blocks=[[nodes.index(n) for n in block] for block in data_blocks]):
+                moms_b, moms_w = self._fully_visible_positive_moments(model, nodes, edges, data_blocks, data)
+                self.assertTrue(jnp.allclose(moms_b, spins.astype(moms_b.dtype)))
+                self.assertTrue(jnp.allclose(moms_w, expected_w.astype(moms_w.dtype)))

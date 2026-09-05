@@ -264,15 +264,23 @@ def estimate_kl_grad(
     cond_batched_pos = jax.tree.map(lambda x: jnp.broadcast_to(x, (data[0].shape[0], *x.shape)), conditioning_values)
 
     if len(init_state_positive) == 0:
-        # if there are no initial states in pos sampling
-        # data[0]: (batch, n_nodes)
-        spins = 2 * data[0].astype(float_type) - 1  # (batch, n_nodes)
-
-        ei_idx = jnp.array([bias_nodes.index(e[0]) for e in weight_edges])  # (n_edges,)
-        ej_idx = jnp.array([bias_nodes.index(e[1]) for e in weight_edges])  # (n_edges,)
-
-        moms_b_pos = spins  # (batch, n_nodes)
-        moms_w_pos = spins[:, ei_idx] * spins[:, ej_idx]  # (batch, n_edges)
+        # There are no free variables in the positive phase, so there is no chain axis to vmap over
+        # (indexing one is what used to raise an IndexError here). The clamped state never changes,
+        # so a single observation is enough regardless of `schedule_positive`. We still go through
+        # `estimate_moments`, which maps nodes to columns through the sampling program's
+        # `BlockSpec`; the moments therefore do not depend on the order the data blocks happen to
+        # list their nodes in, and every data block is used, not just the first.
+        moms_b_pos, moms_w_pos = jax.vmap(
+            lambda c: estimate_moments(
+                key_pos,  # reused across the batch: with no free blocks nothing is sampled
+                bias_nodes,
+                weight_edges,
+                training_spec.program_positive,
+                SamplingSchedule(n_warmup=0, n_samples=1, steps_per_sample=0),
+                [],
+                c,
+            )
+        )(data + cond_batched_pos)
 
         moms_b_pos = moms_b_pos[None]  # (1, batch, n_nodes)
         moms_w_pos = moms_w_pos[None]  # (1, batch, n_edges)
